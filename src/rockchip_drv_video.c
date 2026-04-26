@@ -102,6 +102,7 @@ typedef struct {
     MppBufferGroup priv_group;
     MppBuffer      priv_buf;
 
+    MppFrameFormat fmt;     /* pixel format of last decoded frame (0 = NV12 default) */
     bool         decoded;
     pthread_mutex_t  lock;
     pthread_cond_t   cond;
@@ -156,6 +157,7 @@ static MppCodingType profile_to_coding(VAProfile p) {
     case VAProfileH264High10:    return MPP_VIDEO_CodingAVC;
     case VAProfileHEVCMain:
     case VAProfileHEVCMain10:    return MPP_VIDEO_CodingHEVC;
+    case VAProfileVP8Version0_3: return MPP_VIDEO_CodingVP8;
     case VAProfileVP9Profile0:
     case VAProfileVP9Profile2:   return MPP_VIDEO_CodingVP9;
     case VAProfileAV1Profile0:
@@ -168,8 +170,8 @@ static int profile_idc(VAProfile p) {
     switch (p) {
     case VAProfileH264ConstrainedBaseline: return 66;
     case VAProfileH264Main:                return 77;
-    case VAProfileH264High:
-    case VAProfileH264High10:              return 100;
+    case VAProfileH264High:                return 100;
+    case VAProfileH264High10:              return 110;
     default:                               return 100;
     }
 }
@@ -208,11 +210,14 @@ static VAStatus rk_QueryConfigProfiles(VADriverContextP ctx,
     list[i++] = VAProfileH264ConstrainedBaseline;
     list[i++] = VAProfileH264Main;
     list[i++] = VAProfileH264High;
+    list[i++] = VAProfileH264High10;
     list[i++] = VAProfileHEVCMain;
     list[i++] = VAProfileHEVCMain10;
+    list[i++] = VAProfileVP8Version0_3;
     list[i++] = VAProfileVP9Profile0;
     list[i++] = VAProfileVP9Profile2;
     list[i++] = VAProfileAV1Profile0;
+    list[i++] = VAProfileAV1Profile1;
     *n = i;
     return VA_STATUS_SUCCESS;
 }
@@ -694,6 +699,7 @@ static VAStatus do_h264_decode(RKContext *c, RKDriver *d)
         s->prime_fd = fd;
         s->hstride  = (int)mpp_frame_get_hor_stride(frame);
         s->vstride  = (int)mpp_frame_get_ver_stride(frame);
+        s->fmt      = mpp_frame_get_fmt(frame);
         s->decoded  = true;
         pthread_cond_signal(&s->cond);
         pthread_mutex_unlock(&s->lock);
@@ -821,6 +827,7 @@ static VAStatus do_generic_decode(RKContext *c, RKDriver *d)
         s->prime_fd = fd;
         s->hstride  = (int)mpp_frame_get_hor_stride(frame);
         s->vstride  = (int)mpp_frame_get_ver_stride(frame);
+        s->fmt      = mpp_frame_get_fmt(frame);
         s->decoded  = true;
         pthread_cond_signal(&s->cond);
         pthread_mutex_unlock(&s->lock);
@@ -909,6 +916,7 @@ static VAStatus rk_ExportSurfaceHandle(VADriverContextP ctx,
     int vs       = s->vstride ? s->vstride : s->height;
     bool decoded = s->decoded;
     bool is_placeholder = (s->priv_buf != NULL);
+    bool is_10bit = MPP_FRAME_FMT_IS_YUV_10BIT(s->fmt);
     pthread_mutex_unlock(&s->lock);
 
     if (fd < 0) {
@@ -919,45 +927,64 @@ static VAStatus rk_ExportSurfaceHandle(VADriverContextP ctx,
     int export_fd = dup(fd);
     if (export_fd < 0) return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
-    LOG("ExportSurfaceHandle: surface=0x%x %dx%d stride=%dx%d export_fd=%d decoded=%d placeholder=%d",
-        id, s->width, s->height, hs, vs, export_fd, decoded, is_placeholder);
+    LOG("ExportSurfaceHandle: surface=0x%x %dx%d stride=%dx%d export_fd=%d decoded=%d placeholder=%d 10bit=%d",
+        id, s->width, s->height, hs, vs, export_fd, decoded, is_placeholder, is_10bit);
 
     VADRMPRIMESurfaceDescriptor *desc = descriptor;
     memset(desc, 0, sizeof(*desc));
-    desc->fourcc      = VA_FOURCC_NV12;
     desc->width       = (uint32_t)s->width;
     desc->height      = (uint32_t)s->height;
     desc->num_objects = 1;
-    desc->objects[0].fd                   = export_fd;
-    desc->objects[0].size                 = (uint32_t)(hs * vs * 3 / 2);
-    desc->objects[0].drm_format_modifier  = 0; /* DRM_FORMAT_MOD_LINEAR */
-
-    /*
-     * Firefox (DMABufSurfaceYUV) expects num_layers == plane count, each
-     * layer being a single-plane view of the buffer.  It calls
-     * CreateYUVPlaneExport(i) per layer and always uses PLANE0_* EGL
-     * attributes inside that call.  Exporting as a single NV12 layer with
-     * num_planes=2 causes "plane attribute(s) missing" in eglCreateImageKHR.
-     *
-     * Use the two-layer layout:
-     *   layer 0 → DRM_FORMAT_R8   (Y,  8-bit luma)
-     *   layer 1 → DRM_FORMAT_GR88 (UV, interleaved chroma, 2 bytes/px)
-     */
+    desc->objects[0].fd                  = export_fd;
+    desc->objects[0].drm_format_modifier = 0; /* DRM_FORMAT_MOD_LINEAR */
     desc->num_layers = 2;
 
-    /* Layer 0: Y plane */
-    desc->layers[0].drm_format      = 0x20203852; /* DRM_FORMAT_R8   */
-    desc->layers[0].num_planes      = 1;
-    desc->layers[0].object_index[0] = 0;
-    desc->layers[0].offset[0]       = 0;
-    desc->layers[0].pitch[0]        = (uint32_t)hs;
-
-    /* Layer 1: UV plane (interleaved CbCr → GR88) */
-    desc->layers[1].drm_format      = 0x38385247; /* DRM_FORMAT_GR88 */
-    desc->layers[1].num_planes      = 1;
-    desc->layers[1].object_index[0] = 0;
-    desc->layers[1].offset[0]       = (uint32_t)(hs * vs);
-    desc->layers[1].pitch[0]        = (uint32_t)hs;
+    if (is_10bit) {
+        /*
+         * P010: 10-bit NV12 semi-planar.  Each luma/chroma sample is uint16.
+         * Two-layer layout matching Firefox DMABufSurfaceYUV P010 import:
+         *   layer 0 → DRM_FORMAT_R16    (Y,  16-bit luma, 10 significant bits)
+         *   layer 1 → DRM_FORMAT_GR1616 (UV, 2×16-bit interleaved chroma)
+         * Both layers share pitch = hs*2 (bytes per luma row).
+         * UV offset = hs*vs*2 (Y plane size in bytes).
+         */
+        desc->fourcc                         = VA_FOURCC_P010;
+        desc->objects[0].size                = (uint32_t)(hs * vs * 3);
+        /* Y plane */
+        desc->layers[0].drm_format           = 0x20363152; /* DRM_FORMAT_R16    */
+        desc->layers[0].num_planes           = 1;
+        desc->layers[0].object_index[0]      = 0;
+        desc->layers[0].offset[0]            = 0;
+        desc->layers[0].pitch[0]             = (uint32_t)(hs * 2);
+        /* UV plane */
+        desc->layers[1].drm_format           = 0x36315247; /* DRM_FORMAT_GR1616 */
+        desc->layers[1].num_planes           = 1;
+        desc->layers[1].object_index[0]      = 0;
+        desc->layers[1].offset[0]            = (uint32_t)(hs * vs * 2);
+        desc->layers[1].pitch[0]             = (uint32_t)(hs * 2);
+    } else {
+        /*
+         * NV12: 8-bit YUV 4:2:0 semi-planar.
+         * Firefox (DMABufSurfaceYUV) expects num_layers == plane count, each
+         * layer being a single-plane view of the buffer:
+         *   layer 0 → DRM_FORMAT_R8   (Y,  8-bit luma)
+         *   layer 1 → DRM_FORMAT_GR88 (UV, interleaved chroma, 2 bytes/px)
+         */
+        desc->fourcc                         = VA_FOURCC_NV12;
+        desc->objects[0].size                = (uint32_t)(hs * vs * 3 / 2);
+        /* Y plane */
+        desc->layers[0].drm_format           = 0x20203852; /* DRM_FORMAT_R8   */
+        desc->layers[0].num_planes           = 1;
+        desc->layers[0].object_index[0]      = 0;
+        desc->layers[0].offset[0]            = 0;
+        desc->layers[0].pitch[0]             = (uint32_t)hs;
+        /* UV plane */
+        desc->layers[1].drm_format           = 0x38385247; /* DRM_FORMAT_GR88 */
+        desc->layers[1].num_planes           = 1;
+        desc->layers[1].object_index[0]      = 0;
+        desc->layers[1].offset[0]            = (uint32_t)(hs * vs);
+        desc->layers[1].pitch[0]             = (uint32_t)hs;
+    }
     return VA_STATUS_SUCCESS;
 }
 
@@ -967,7 +994,10 @@ static VAStatus rk_QueryImageFormats(VADriverContextP ctx,
     list[0].fourcc         = VA_FOURCC_NV12;
     list[0].byte_order     = VA_LSB_FIRST;
     list[0].bits_per_pixel = 12;
-    *n = 1;
+    list[1].fourcc         = VA_FOURCC_P010;
+    list[1].byte_order     = VA_LSB_FIRST;
+    list[1].bits_per_pixel = 24;
+    *n = 2;
     return VA_STATUS_SUCCESS;
 }
 
@@ -1140,7 +1170,7 @@ static VAStatus rk_QuerySurfaceAttrs(VADriverContextP ctx, VAConfigID config,
         config, attrib_list ? "provided" : "NULL (query count)");
 
     /* Firefox calls this twice: first with NULL to get count, then with buffer */
-    const unsigned int n = 3;
+    const unsigned int n = 4;
     if (!attrib_list) {
         *num_attribs = n;
         return VA_STATUS_SUCCESS;
@@ -1150,28 +1180,34 @@ static VAStatus rk_QuerySurfaceAttrs(VADriverContextP ctx, VAConfigID config,
         return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
     }
 
-    /* Pixel format: NV12 */
+    /* Pixel format: NV12 (8-bit) */
     attrib_list[0].type              = VASurfaceAttribPixelFormat;
     attrib_list[0].flags             = VA_SURFACE_ATTRIB_GETTABLE;
     attrib_list[0].value.type        = VAGenericValueTypeInteger;
     attrib_list[0].value.value.i     = VA_FOURCC_NV12;
 
-    /* Memory type: VA-managed + DRM PRIME 2 */
-    attrib_list[1].type              = VASurfaceAttribMemoryType;
-    attrib_list[1].flags             = VA_SURFACE_ATTRIB_GETTABLE |
-                                       VA_SURFACE_ATTRIB_SETTABLE;
+    /* Pixel format: P010 (10-bit) */
+    attrib_list[1].type              = VASurfaceAttribPixelFormat;
+    attrib_list[1].flags             = VA_SURFACE_ATTRIB_GETTABLE;
     attrib_list[1].value.type        = VAGenericValueTypeInteger;
-    attrib_list[1].value.value.i     = (int)(VA_SURFACE_ATTRIB_MEM_TYPE_VA |
+    attrib_list[1].value.value.i     = VA_FOURCC_P010;
+
+    /* Memory type: VA-managed + DRM PRIME 2 */
+    attrib_list[2].type              = VASurfaceAttribMemoryType;
+    attrib_list[2].flags             = VA_SURFACE_ATTRIB_GETTABLE |
+                                       VA_SURFACE_ATTRIB_SETTABLE;
+    attrib_list[2].value.type        = VAGenericValueTypeInteger;
+    attrib_list[2].value.value.i     = (int)(VA_SURFACE_ATTRIB_MEM_TYPE_VA |
                                        VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2);
 
     /* Max resolution */
-    attrib_list[2].type              = VASurfaceAttribMaxWidth;
-    attrib_list[2].flags             = VA_SURFACE_ATTRIB_GETTABLE;
-    attrib_list[2].value.type        = VAGenericValueTypeInteger;
-    attrib_list[2].value.value.i     = 7680;
+    attrib_list[3].type              = VASurfaceAttribMaxWidth;
+    attrib_list[3].flags             = VA_SURFACE_ATTRIB_GETTABLE;
+    attrib_list[3].value.type        = VAGenericValueTypeInteger;
+    attrib_list[3].value.value.i     = 7680;
 
     *num_attribs = n;
-    LOG("QuerySurfaceAttributes: returned %u attribs (NV12, DRM_PRIME_2)", n);
+    LOG("QuerySurfaceAttributes: returned %u attribs (NV12, P010, DRM_PRIME_2)", n);
     return VA_STATUS_SUCCESS;
 }
 
