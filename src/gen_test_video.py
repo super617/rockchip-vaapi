@@ -10,11 +10,11 @@ Características:
       Cada banda = BAND_H filas, Y=235 (blanco) ó Y=16 (negro)
   - 5 sprites de colores con movimiento senoidal
   - Fondo degradado diagonal en scroll
-  - 25 s + de vídeo a 30 fps
 
 Uso:
-  python3 gen_test_video.py [NFRAMES]  > /tmp/test_src.y4m
-  python3 gen_test_video.py            > /tmp/test_src.y4m   (usa 900 frames)
+  python3 gen_test_video.py [NFRAMES [W H]]  > out.y4m
+  python3 gen_test_video.py                  > out.y4m   (900 frames 640×480)
+  python3 gen_test_video.py 300 3840 2160    > out.y4m   (300 frames 4K)
 
 El stream es YUV4MPEG2 (y4m) en stdout.  Pásalo a ffmpeg para codificar.
 
@@ -29,28 +29,42 @@ import numpy as np
 
 # ── Parámetros ──────────────────────────────────────────────────────────────
 
-W, H   = 640, 480
-FPS    = 30
-NFRAMES = int(sys.argv[1]) if len(sys.argv) > 1 else 900   # 30 s
+NFRAMES = int(sys.argv[1]) if len(sys.argv) > 1 else 900
+W       = int(sys.argv[2]) if len(sys.argv) > 2 else 640
+H       = int(sys.argv[3]) if len(sys.argv) > 3 else 480
+FPS     = 30
+
+# W and H must be even (YUV420 chroma sub-sampling requirement)
+W = W & ~1
+H = H & ~1
 
 BARCODE_W = 64      # ancho de la banda de barcode (debe coincidir con el .c)
 N_BANDS   = 13      # 3 sync + 10 data bits
-BAND_H    = H // N_BANDS   # altura de cada banda en filas (= 36 px para 480)
+BAND_H    = H // N_BANDS   # altura de cada banda en filas
 
-# ── Sprites ──────────────────────────────────────────────────────────────────
-# Cada entrada: (periodo_x, periodo_y, fase_x, fase_y, amp_x, amp_y,
-#                centro_x, centro_y, Y, U, V, ancho, alto)
-SPRITES = [
+# ── Sprites (escalan con la resolución) ──────────────────────────────────────
+# Cada entrada: (periodo_x, periodo_y, fase_x, fase_y, amp_x_frac, amp_y_frac,
+#                cx_frac, cy_frac, Y, U, V, sw_frac, sh_frac)
+# amp/centro/size expresados como fracción de W o H; se resuelven abajo.
+_SP = [
     # Rojo rápido
-    (47, 61,  0,  0, 220, 160, 380, 240,  81,  90, 240, 70, 70),
+    (47, 61,  0,  0, 0.344, 0.333, 0.594, 0.500,  81,  90, 240, 0.109, 0.146),
     # Verde lento
-    (83, 97, 30, 50, 180, 130, 350, 220, 145,  54, 34,  80, 60),
+    (83, 97, 30, 50, 0.281, 0.271, 0.547, 0.458, 145,  54,  34, 0.125, 0.125),
     # Azul diagonal
-    (53, 71, 60, 10, 200, 180, 420, 260,  41, 240, 110, 65, 65),
+    (53, 71, 60, 10, 0.313, 0.375, 0.656, 0.542,  41, 240, 110, 0.102, 0.135),
     # Amarillo pequeño rápido
-    (29, 43, 15, 80, 250, 170, 300, 200, 210, 146,  16, 50, 50),
+    (29, 43, 15, 80, 0.391, 0.354, 0.469, 0.417, 210, 146,  16, 0.078, 0.104),
     # Cian grande lento
-    (113, 89, 45, 35, 170, 120, 500, 300, 170, 166,  10, 90, 75),
+    (113, 89, 45, 35, 0.266, 0.250, 0.781, 0.625, 170, 166,  10, 0.141, 0.156),
+]
+SPRITES = [
+    (px, py, phx, phy,
+     int(ax * W), int(ay * H),
+     int(cx * W), int(cy * H),
+     yv, uv, vv,
+     max(8, int(sw * W)), max(8, int(sh * H)))
+    for (px, py, phx, phy, ax, ay, cx, cy, yv, uv, vv, sw, sh) in _SP
 ]
 
 # ── Generador de frames ───────────────────────────────────────────────────────

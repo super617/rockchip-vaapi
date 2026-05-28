@@ -889,8 +889,14 @@ static VAStatus do_generic_decode(RKContext *c, RKDriver *d)
      * marking the surface decoded with prime_fd=-1 (safe: ExportSurfaceHandle
      * returns ERROR_INVALID_SURFACE which Firefox must tolerate). */
     if (is_hidden) {
-        LOG("do_generic_decode: altref hidden, polling up to 50ms");
-        for (int tries = 0; tries < 50; tries++) {
+        /* Poll window scales with packet size (same formula as shown frames),
+         * capped at 500ms so large 4K altrefs don't stall. */
+        int alt_poll_ms = (int)(pkt_sz / 500);
+        if (alt_poll_ms < 50)  alt_poll_ms = 50;
+        if (alt_poll_ms > 500) alt_poll_ms = 500;
+        LOG("do_generic_decode: altref hidden, polling up to %dms (pkt_sz=%zu)",
+            alt_poll_ms, pkt_sz);
+        for (int tries = 0; tries < alt_poll_ms; tries++) {
             RKSurface *tgt = surface_by_id(d, c->render_target);
             if (tgt) {
                 pthread_mutex_lock(&tgt->lock);
