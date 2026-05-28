@@ -843,8 +843,8 @@ static VAStatus do_generic_decode(RKContext *c, RKDriver *d)
         return VA_STATUS_SUCCESS;
     }
 
-    /* Detect VP9 altref (show_frame=0): MPP decodes them as internal references
-     * but never outputs them via decode_get_frame — polling would stall 500ms. */
+    /* Detect VP9 altref (show_frame=0): MPP decodes them and does output them
+     * via decode_get_frame, but with a short delay (similar to inter frames). */
     bool is_hidden = (c->coding == MPP_VIDEO_CodingVP9) &&
                      !vp9_show_frame(pkt_data, pkt_sz);
 
@@ -881,25 +881,46 @@ static VAStatus do_generic_decode(RKContext *c, RKDriver *d)
         return VA_STATUS_ERROR_DECODING_ERROR;
     }
 
-    /* Altref frames are never output by MPP — mark decoded immediately and
-     * advance the FIFO head so subsequent frames route correctly. */
+    /* Altref frames (show_frame=0): poll briefly to see if MPP outputs the
+     * decoded frame.  Some MPP builds do output altref content; capturing it
+     * allows ExportSurfaceHandle to succeed if Firefox later references the
+     * surface via show_existing_frame.  50ms window is enough for inter-frame
+     * speed decodes; if MPP does not output within that window we fall back to
+     * marking the surface decoded with prime_fd=-1 (safe: ExportSurfaceHandle
+     * returns ERROR_INVALID_SURFACE which Firefox must tolerate). */
     if (is_hidden) {
-        LOG("do_generic_decode: altref hidden, no poll");
+        LOG("do_generic_decode: altref hidden, polling up to 50ms");
+        for (int tries = 0; tries < 50; tries++) {
+            RKSurface *tgt = surface_by_id(d, c->render_target);
+            if (tgt) {
+                pthread_mutex_lock(&tgt->lock);
+                bool done = tgt->decoded;
+                pthread_mutex_unlock(&tgt->lock);
+                if (done) break;
+            }
+            MppFrame frame = NULL;
+            if (c->mpi->decode_get_frame(c->mpp, &frame) == MPP_OK && frame)
+                assign_mpp_frame(frame, c, d);
+            else
+                usleep(1000);
+        }
+        /* Fallback: if MPP did not output the altref, mark decoded/invalid. */
         RKSurface *tgt = surface_by_id(d, c->render_target);
         if (tgt) {
-            /* Invalidate stale prime_fd: MPP never outputs altref frames, so the
-             * surface retains whatever fd it had from a previous P-frame.  If
-             * Firefox later issues show_existing_frame pointing here,
-             * ExportSurfaceHandle must return ERROR_INVALID_SURFACE rather than
-             * serving the old content. */
-            if (tgt->prime_fd >= 0) { close(tgt->prime_fd); tgt->prime_fd = -1; }
             pthread_mutex_lock(&tgt->lock);
-            tgt->decoded = true;
-            pthread_cond_signal(&tgt->cond);
+            bool already = tgt->decoded;
             pthread_mutex_unlock(&tgt->lock);
+            if (!already) {
+                if (tgt->prime_fd >= 0) { close(tgt->prime_fd); tgt->prime_fd = -1; }
+                pthread_mutex_lock(&tgt->lock);
+                tgt->decoded = true;
+                pthread_cond_signal(&tgt->cond);
+                pthread_mutex_unlock(&tgt->lock);
+                if (c->dq_head != c->dq_tail &&
+                    c->decode_queue[c->dq_head] == c->render_target)
+                    c->dq_head = (c->dq_head + 1) & 63;
+            }
         }
-        if (c->dq_head != c->dq_tail && c->decode_queue[c->dq_head] == c->render_target)
-            c->dq_head = (c->dq_head + 1) & 63;
         return VA_STATUS_SUCCESS;
     }
 

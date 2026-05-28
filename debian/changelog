@@ -1,3 +1,27 @@
+rockchip-vaapi (1.0.9-1) noble; urgency=high
+
+  * Fix VP9 altref (show_frame=0) ExportSurfaceHandle crash: MPP does output
+    altref frames via decode_get_frame (prior assumption that it never did was
+    wrong). EndPicture for altref frames now polls MPP for up to 50ms; if MPP
+    delivers the frame within that window the surface gets a valid DMA-BUF fd.
+    This allows Firefox to call ExportSurfaceHandle on altref surfaces without
+    receiving ERROR_INVALID_SURFACE, eliminating the NS_ERROR_DOM_MEDIA_FATAL_ERR
+    crash at DASH quality switches where Firefox may reference the altref surface
+    via show_existing_frame. If MPP does not output within 50ms (safety fallback)
+    the surface is still marked decoded with prime_fd=-1, same as v1.0.8.
+  * Fix VP9 altref temporal glitch: since altref surfaces now carry the correct
+    decoded content, show_existing_frame references to them display the right
+    frame instead of producing a blank/error screen.
+  * Add src/gen_test_video.py: generates 640×480 30fps YUV4MPEG2 test video
+    with sinusoidal sprites and a binary barcode strip encoding the frame number.
+  * Add src/va_barcode_test.c: VA-API hardware decode correctness test that
+    decodes IVF/VP9 streams and verifies each exported frame's barcode matches
+    the expected source frame number. Tests both shown and hidden (altref) frames.
+    Build: gcc -O1 -o va_barcode_test src/va_barcode_test.c -lva -lva-drm -ldrm
+           -I/usr/include/libdrm
+
+ -- Eduardo García-Mádico Portabella <woodyst@gmail.com>  Thu, 28 May 2026 16:00:00 +0000
+
 rockchip-vaapi (1.0.8-1) noble; urgency=medium
 
   * Fix H.264 decode: mpp_init must be called before MPP_DEC_SET_CFG and
