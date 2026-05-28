@@ -207,6 +207,65 @@ attrs[3].value.value.i = 4320;
 
 ---
 
+## Memory model and the CMA constraint (4K)
+
+There are two distinct pools of memory in play, and confusing them leads to
+chasing the wrong bug:
+
+| Buffer | Allocated by | Backing memory | Must be contiguous? |
+|--------|--------------|----------------|---------------------|
+| Per-surface output buffer (`priv_buf`) | this driver, in `CreateSurfaces` via `mpp_buffer_group_get_internal(MPP_BUFFER_TYPE_DRM)` | **system** dma-heap (not CMA) | no |
+| MPP decode DPB (reference + work frames) | MPP internally | **CMA** (the VPU does DMA into it) | **yes** |
+| GPU compositor textures | Mali / Mesa in Firefox | **CMA** | **yes** |
+
+The driver copies each decoded frame out of MPP's DPB buffer into the surface's
+own `priv_buf` (in `assign_mpp_frame`) so that MPP can immediately recycle its
+small internal pool — see *Per-surface output buffers* below. Because `priv_buf`
+lives in system memory, the driver is **not** a significant CMA consumer; you
+can allocate hundreds of MB of surfaces without touching CMA.
+
+The CMA pressure comes entirely from **MPP's DPB + the GPU compositor**, which
+share the single kernel CMA region (`cma=` on the kernel command line, default
+256 MB on most RK3588 images). A 4K NV12 frame is ~12.5 MB; VP9 keeps ~10
+references, so the DPB alone is ~125–200 MB. Add the GPU's 4K compositing
+buffers and 256 MB is not enough.
+
+**Symptom of CMA exhaustion (important — it does not look like a driver bug):**
+the 4K context acknowledges `info_change`, decodes 70–80 frames cleanly
+(`copied=1`, no `TIMEOUT`, no VA error), then Firefox reports
+`NS_ERROR_DOM_MEDIA_FATAL_ERR` with **no driver-side error at all**. MPP cannot
+surface a failed contiguous allocation through the libva API, so from the
+driver's point of view every call succeeded. The standalone `va_barcode_test`
+decodes the same 4K stream fine because it does no GPU compositing and therefore
+never contends for CMA.
+
+**Fix:** raise CMA to `cma=512M` (or more) on the kernel command line. This is a
+platform/deployment setting, not a driver change. See `INSTALL.md`.
+
+Contrast this with AV1, which is a genuine *parse* failure: AV1 never
+acknowledges `info_change` and decodes zero frames, because VA-API hands MPP
+headerless tile data instead of a full OBU bitstream. CMA exhaustion is the
+opposite — decode works, then a resource runs out.
+
+### Per-surface output buffers
+
+Each `RKSurface` owns a permanent `priv_buf` allocated in `CreateSurfaces` and
+kept for the surface's lifetime (its `prime_fd` never changes). `assign_mpp_frame`
+copies MPP's decoded pixels into it using MPP's *real* hor/ver strides
+(e.g. 3840×2176 for 4K — note the 2176 ver-stride padding) and then releases the
+MPP frame immediately. This avoids two earlier bugs:
+
+- **Buffer aliasing ("saltando frames")**: MPP's internal display pool is only
+  ~3 buffers for 4K; exporting MPP's fd directly meant MPP overwrote a buffer the
+  compositor was still showing. Copying into a dedicated per-surface buffer fixes
+  this.
+- **Stale altref export**: VP9 altref (hidden, `show_frame=0`) frames are decoded
+  by MPP as references but **not** output via `decode_get_frame` in this
+  environment. The driver therefore does **not** poll/block for them (blocking
+  per altref accumulated latency until Firefox's pipeline underran); it sends the
+  altref to MPP, marks the surface decoded immediately, and lets the permanent
+  `priv_buf` keep `ExportSurfaceHandle` valid.
+
 ## `bs.h` — Exp-Golomb bitstream writer
 
 A header-only, zero-dependency, inline bitstream writer:

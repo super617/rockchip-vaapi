@@ -1,3 +1,101 @@
+rockchip-vaapi (1.0.11-1) noble; urgency=high
+
+  * Fix 4K@60fps stability: >30000 frames decoded without NS_ERROR in Firefox,
+    including clean DASH quality switches. Seven improvements:
+  * CMA requirement documented and DTB fix: 4K VP9 decode needs ≥512MB CMA.
+    The RK3588 DTB hardcodes CMA with a fixed reg address that overrides any
+    cma= kernel command line parameter. Fix: patch the DTB with fdtput to change
+    the reg size from 256MB to 512MB, or alternatively add cma=512M to the
+    kernel command line (if the DTB node is removed/reusable). Without this,
+    4K playback fails after ~75 frames with NS_ERROR_DOM_MEDIA_FATAL_ERR.
+  * Conditional logging: LOG was unconditional fprintf to stderr on every VA-API
+    call (~500/s at 60fps). This stalled Firefox's decode thread enough to
+    trigger NS_ERROR at DASH segment boundaries. LOG is now a no-op unless the
+    RK_VAAPI_LOG environment variable is set to a file path.
+  * COMPOSED_LAYERS in ExportSurfaceHandle: mpv and GStreamer request
+    VA_EXPORT_SURFACE_COMPOSED_LAYERS (flags=0x9). Now returns DRM_FORMAT_NV12
+    (or DRM_FORMAT_P010 for 10-bit) with 2 planes in one layer instead of always
+    using the R8/GR88 split required by Firefox. Fixes green screen in mpv
+    --vo=dmabuf-wayland.
+  * rk_GetImage implemented: was a stub returning success without copying
+    data. vaapi-copy mode showed a green screen; now copies Y+UV planes from
+    priv_buf with proper stride re-packing to the image buffer layout.
+  * rk_DeriveImage: returned ERROR_INVALID_SURFACE due to s->frame always being
+    NULL (removed in v1.0.10). Now returns ERROR_OPERATION_FAILED explicitly so
+    callers fall back to vaGetImage cleanly.
+  * Async EndPicture: EndPicture previously blocked for up to 1671ms on large
+    4K keyframes (835KB first frame of each DASH segment). Firefox's media
+    pipeline froze during this stall and fired NS_ERROR. EndPicture now returns
+    immediately after decode_put_packet; SyncSurface handles all waiting.
+  * Sync in ExportSurfaceHandle: with async EndPicture, Firefox calls
+    ExportSurfaceHandle before SyncSurface. The EGLImage was created from stale
+    priv_buf data causing a green bar / progressive color artifacts. If a decode
+    is in progress when ExportSurfaceHandle is called, it now syncs the surface
+    first to guarantee the exported DMA-BUF contains the correct frame.
+
+ -- Eduardo García-Mádico Portabella <woodyst@gmail.com>  Wed, 28 May 2026 00:00:00 +0200
+
+rockchip-vaapi (1.0.10-1) noble; urgency=high
+
+  * Fix "saltando frames" (wrong video frames in Firefox compositor): MPP uses
+    only ~3 internal DMA-BUF buffers for 4K VP9 decode regardless of how many
+    VA surfaces Firefox allocates. Previously assign_mpp_frame stored MPP's
+    MppFrame reference in the surface and exposed MPP's buffer fd directly;
+    BeginPicture called mpp_frame_deinit() which released MPP's reference,
+    allowing it to immediately reuse the physical buffer while Firefox's
+    compositor thread still held an export_fd pointing to it.
+  * Fix: each VA surface now owns a dedicated permanent DMA-BUF (priv_buf,
+    allocated at CreateSurfaces). assign_mpp_frame copies decoded pixels from
+    MPP's internal buffer into this dedicated buffer, then releases MPP's
+    buffer immediately. prime_fd is set once at CreateSurfaces and never
+    changes for the surface's lifetime. ExportSurfaceHandle always exports
+    the surface's own stable buffer, which Firefox can hold indefinitely
+    without risk of MPP overwriting it.
+  * Allocation size for dedicated buffer raised from hs*vs*3/2 to hs*vs*3 to
+    cover both NV12 (8-bit) and P010 (10-bit YUV420) in a single allocation.
+  * SyncSurface: replace priv_buf-presence shortcut with ctx_id==0 check to
+    distinguish "placeholder not yet decoded" from "decode in progress".
+  * Fix H.264 decode never producing any frame (every SyncSurface timed out →
+    NS_ERROR_DOM_MEDIA_FATAL_ERR): h264_write_sps emitted only 7 bits between
+    profile_idc and level_idc instead of the required 8 (constraint_set0..5 +
+    reserved_zero_2bits). The missing bit misaligned the entire SPS RBSP, so
+    MPP could not parse it and never raised the info_change event needed to
+    allocate output buffers. Now writes the correct 8 bits; verified the
+    reconstructed SPS round-trips to profile/level/dimensions.
+  * Fix VP9 altref crash regression: the altref fallback (when MPP does not
+    output a hidden frame within the poll window) was still closing the
+    surface's prime_fd and setting it to -1, left over from v1.0.9. With the
+    new permanent per-surface priv_buf, that destroyed the surface's only DMA-BUF
+    fd; when the slot was later reused for a shown frame, assign_mpp_frame copied
+    pixels into priv_buf but no longer reassigns prime_fd, leaving it -1 →
+    ExportSurfaceHandle returned ERROR_INVALID_SURFACE → NS_ERROR_DOM_MEDIA_FATAL_ERR.
+    The fallback now keeps prime_fd valid (placeholder content) so export always
+    succeeds.
+  * Fix Firefox falling back to software after ~160 frames of 4K VP9
+    (NS_ERROR_DOM_MEDIA_FATAL_ERR): the altref (show_frame=0) EndPicture poll
+    blocked the decode thread for the full poll window (up to 500ms) on every
+    hidden frame, because MPP decodes altrefs internally as references but never
+    outputs them via decode_get_frame in this environment. The per-altref stalls
+    accumulated until Firefox's decode pipeline underran and declared a fatal
+    error. Altref frames are now sent to MPP (still decoded as references) and
+    their surface marked decoded immediately with no poll; the permanent priv_buf
+    keeps ExportSurfaceHandle valid, and the next frame's pre-drain still recovers
+    altref content if MPP emits it late (verified: barcode hidden-frame checks
+    still pass). Altref surfaces are also no longer enqueued in the PTS-routing
+    FIFO, since MPP never produces a matching output to advance the head past them.
+  * assign_mpp_frame: adopt MPP's real hor/ver strides (e.g. 3840x2176 for 4K)
+    for both the priv_buf copy and the exported descriptor, so the DMA-BUF layout
+    is self-consistent and a non-4K stride mismatch can no longer overflow.
+  * Stop advertising AV1 (VAProfileAV1Profile0/1). VA-API delivers AV1 as a
+    parsed VAPictureParameterBufferAV1 plus headerless tile data, but MPP needs
+    a complete OBU bytestream (sequence header + frame header + tile group OBUs)
+    which would have to be reconstructed from the struct. Until that serializer
+    exists, advertising AV1 made Firefox attempt it, stall 3s per frame in
+    SyncSurface and fall back; not advertising it lets Firefox pick VP9
+    (hardware-decoded) directly for AV1-capable content.
+
+ -- Eduardo García-Mádico Portabella <woodyst@gmail.com>  Thu, 28 May 2026 20:00:00 +0000
+
 rockchip-vaapi (1.0.9-1) noble; urgency=high
 
   * Fix VP9 altref (show_frame=0) ExportSurfaceHandle crash: MPP does output

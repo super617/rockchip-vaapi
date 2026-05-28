@@ -1,5 +1,37 @@
 # Installation guide — rockchip-vaapi
 
+## System requirements
+
+### Contiguous memory (CMA) — required for 4K
+
+The RK3588 VPU decodes into **physically contiguous** memory (CMA —
+Contiguous Memory Allocator), and the Mali GPU also draws compositing buffers
+from the same CMA pool. A single 4K NV12 frame is ~12.5 MB and the VP9 decoder
+keeps ~10 reference frames in flight (~125–200 MB), so 4K decode **plus** 4K GPU
+compositing together need well over the default `cma=256M`.
+
+With only 256 MB CMA, 4K playback in Firefox decodes correctly for a few
+seconds and then dies with `NS_ERROR_DOM_MEDIA_FATAL_ERR` and falls back to
+software — the VPU can no longer allocate a contiguous buffer once the GPU has
+taken its share. (1080p frames are 4× smaller and never hit the limit.)
+
+**Set `cma=512M`** (or higher) on the kernel command line and reboot:
+
+- Armbian / mainline u-boot: edit `/boot/armbianEnv.txt`, add or change
+  `extraargs=cma=512M` (append to any existing `extraargs`).
+- extlinux: edit the `append` line in `/boot/extlinux/extlinux.conf`, add `cma=512M`.
+
+Verify after reboot:
+
+```bash
+cat /proc/cmdline | tr ' ' '\n' | grep cma     # → cma=512M
+grep CmaTotal /proc/meminfo                     # → CmaTotal: 524288 kB
+```
+
+> The driver's own per-surface buffers come from the *system* dma-heap (not CMA),
+> so they are not the constraint; the CMA pressure is MPP's decode DPB plus the
+> GPU compositor. See `docs/DEVELOPMENT.md` for details.
+
 ## Option A: Install from Debian package (recommended)
 
 ```bash
@@ -135,9 +167,32 @@ sudo usermod -aG video,render $USER
 Then log out and back in (or use `newgrp video`).
 
 **No frames decoded / black screen**
-Enable verbose logging:
+Enable verbose logging by setting `RK_VAAPI_LOG` to a file path:
 ```bash
-LIBVA_DRIVER_NAME=rockchip MOZ_DISABLE_RDD_SANDBOX=1 firefox 2>&1 | grep rk-vaapi
+LIBVA_DRIVER_NAME=rockchip RK_VAAPI_LOG=/tmp/rk.log MOZ_DISABLE_RDD_SANDBOX=1 firefox
+tail -f /tmp/rk.log | grep -E "copied|TIMEOUT|ERROR|failed"
 ```
 Look for errors after `BeginPicture` or `EndPicture`. Missing SPS/PPS or
-MPP decode errors will appear there.
+MPP decode errors will appear there. Without `RK_VAAPI_LOG`, the driver
+produces no output (logging is disabled by default for performance).
+
+**4K plays for a few seconds then falls back to software
+(`NS_ERROR_DOM_MEDIA_FATAL_ERR`)**
+This is CMA exhaustion. The driver log will show frames decoded normally
+(`copied=1`, no errors) for ~75 frames then a fatal error with no driver-side
+cause — MPP cannot report a failed contiguous allocation through libva.
+Increase CMA to `cma=512M` (see *System requirements* above).
+
+Note: on some RK3588 boards the DTB hardcodes the CMA region with a fixed
+physical address (`reg` property), which overrides any `cma=` command-line
+parameter. If `grep CmaTotal /proc/meminfo` still shows 262144 kB after adding
+`cma=512M`, patch the DTB directly:
+
+```bash
+sudo cp /boot/dtb/rockchip/rk3588-orangepi-5-plus.dtb \
+        /boot/dtb/rockchip/rk3588-orangepi-5-plus.dtb.bak
+sudo fdtput -t x /boot/dtb/rockchip/rk3588-orangepi-5-plus.dtb \
+        /reserved-memory/cma reg 0x00 0x10000000 0x00 0x20000000
+```
+
+Then reboot and verify `grep CmaTotal /proc/meminfo` → `524288 kB`.
