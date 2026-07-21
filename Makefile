@@ -1,14 +1,14 @@
-CC      := gcc
-CFLAGS  := -O2 -Wall -Wextra -fPIC -shared \
+CC      ?= gcc
+CFLAGS  ?= -O2 -Wall -Wextra -fPIC -shared \
            $(shell pkg-config --cflags libva 2>/dev/null) \
            -I/usr/include/rockchip
-LDFLAGS := $(shell pkg-config --libs libva 2>/dev/null) \
+LDFLAGS ?= $(shell pkg-config --libs libva 2>/dev/null) \
            -lrockchip_mpp -lpthread -ldl
 
 TARGET  := rockchip_drv_video.so
 SRCS    := src/rockchip_drv_video.c src/h264.c
 OBJS    := $(SRCS:.c=.o)
-INSTALL_DIR := /usr/lib/aarch64-linux-gnu/dri
+INSTALL_DIR ?= /usr/lib/aarch64-linux-gnu/dri
 
 all: $(TARGET)
 
