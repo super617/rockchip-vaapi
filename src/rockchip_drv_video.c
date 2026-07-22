@@ -96,7 +96,6 @@ typedef struct {
 typedef struct {
     bool         used;
     int          width, height;
-
     /* filled after decode */
     MppFrame     frame;          /* always NULL (kept for ABI compat) */
     int          prime_fd;       /* dup'd fd to priv_buf, stable for surface lifetime */
@@ -111,6 +110,12 @@ typedef struct {
      * capability probes (Firefox DMABUF probe before any decode). */
     MppBufferGroup priv_group;
     MppBuffer      priv_buf;
+
+    /* Zero-copy path: fd dup'd from MPP's decoded frame buffer.
+     * When valid (>0), ExportSurfaceHandle uses this instead of priv_buf
+     * to avoid stride mismatch between MPP's internal buffer and our
+     * priv_buf allocation. Set in assign_mpp_frame, closed on destroy. */
+    int          decoded_fd;
 
     MppFrameFormat fmt;     /* pixel format of last decoded frame (0 = NV12 default) */
     bool         decoded;
@@ -198,6 +203,7 @@ static VAStatus rk_Terminate(VADriverContextP ctx) {
     for (int i = 0; i < MAX_SURFACES; i++) {
         if (!d->surfaces[i].used) continue;
         if (d->surfaces[i].frame) mpp_frame_deinit(&d->surfaces[i].frame);
+        if (d->surfaces[i].decoded_fd >= 0) close(d->surfaces[i].decoded_fd);
         if (d->surfaces[i].prime_fd >= 0) close(d->surfaces[i].prime_fd);
         if (d->surfaces[i].priv_buf)   mpp_buffer_put(d->surfaces[i].priv_buf);
         if (d->surfaces[i].priv_group) mpp_buffer_group_put(d->surfaces[i].priv_group);
@@ -343,6 +349,7 @@ static VAStatus rk_CreateSurfaces(VADriverContextP ctx,
             for (int j = 0; j < allocated; j++) {
                 unsigned idx = ids[j] - SURFACE_ID_BASE;
                 RKSurface *rb = &d->surfaces[idx];
+                if (rb->decoded_fd >= 0) close(rb->decoded_fd);
                 if (rb->prime_fd >= 0) close(rb->prime_fd);
                 if (rb->priv_buf)   mpp_buffer_put(rb->priv_buf);
                 if (rb->priv_group) mpp_buffer_group_put(rb->priv_group);
@@ -354,15 +361,20 @@ static VAStatus rk_CreateSurfaces(VADriverContextP ctx,
         }
         RKSurface *surf = &d->surfaces[i];
         memset(surf, 0, sizeof(*surf));
-        surf->used     = true;
-        surf->width    = width;
-        surf->height   = height;
-        surf->prime_fd = -1;
+        surf->used      = true;
+        surf->width     = width;
+        surf->height    = height;
+        surf->prime_fd  = -1;
+        surf->decoded_fd = -1;
 
         /* Pre-allocate placeholder DMA-BUF so ExportSurfaceHandle succeeds
-         * before any decode (e.g. Firefox's DMABUF capability probe). */
+         * before any decode (e.g. Firefox's DMABUF capability probe).
+         * Use 64-byte alignment to match MPP's internal stride (MPP uses
+         * 64-byte aligned hor_stride; 16-byte alignment caused stride
+         * mismatch → garbled output when assign_mpp_frame copies decoded
+         * pixels with MPP's wider stride into a narrower buffer). */
         {
-            unsigned hs = (unsigned)((width  + 15) & ~15);
+            unsigned hs = (unsigned)((width  + 63) & ~63);
             unsigned vs = (unsigned)((height + 15) & ~15);
             MppBufferGroup grp = NULL;
             MppBuffer      buf = NULL;
@@ -406,6 +418,7 @@ static VAStatus rk_DestroySurfaces(VADriverContextP ctx,
         RKSurface *s = surface_by_id(d, list[i]);
         if (!s) continue;
         if (s->frame)      mpp_frame_deinit(&s->frame);
+        if (s->decoded_fd >= 0) { close(s->decoded_fd); s->decoded_fd = -1; }
         if (s->prime_fd >= 0) close(s->prime_fd);
         if (s->priv_buf)   { mpp_buffer_put(s->priv_buf);        s->priv_buf   = NULL; }
         if (s->priv_group) { mpp_buffer_group_put(s->priv_group); s->priv_group = NULL; }
@@ -661,28 +674,31 @@ static void assign_mpp_frame(MppFrame frame, RKContext *c, RKDriver *d)
     int            fvs    = (int)mpp_frame_get_ver_stride(frame);
     MppFrameFormat ffmt   = mpp_frame_get_fmt(frame);
 
+    /* Copy decoded pixels into priv_buf using MPP's ACTUAL stride for both
+     * src and dst. This eliminates stride mismatch (the root cause of
+     * garbled output) while keeping MPP's buffer pool recyclable.
+     * We cannot do zero-copy (dup MPP buffer fd) because MPP reclaims
+     * its buffers for the next decode and asserts if they're still held. */
     int  copy_w = fwidth  > 0 ? fwidth  : s->width;
     int  copy_h = fheight > 0 ? fheight : s->height;
     int  src_hs = fhs > 0 ? fhs : copy_w;
     int  src_vs = fvs > 0 ? fvs : copy_h;
+    /* Use MPP's stride for dst too — priv_buf was allocated large enough
+     * in CreateSurfaces (64-byte aligned, which matches MPP's alignment). */
+    int  dst_hs = src_hs;
+    int  dst_vs = src_vs;
     bool i10    = MPP_FRAME_FMT_IS_YUV_10BIT(ffmt);
     int  bpp    = i10 ? 2 : 1;
     int  copied = 0;
     void *src = buf ? mpp_buffer_get_ptr(buf) : NULL;
     void *dst = s->priv_buf ? mpp_buffer_get_ptr(s->priv_buf) : NULL;
     if (src && dst) {
-        const uint8_t *sy = (const uint8_t *)src;
-        uint8_t       *dy = (uint8_t       *)dst;
-        for (int r = 0; r < copy_h; r++)
-            memcpy(dy + (size_t)r * src_hs * bpp,
-                   sy + (size_t)r * src_hs * bpp,
-                   (size_t)src_hs * bpp);
-        const uint8_t *su = sy + (size_t)src_hs * src_vs * bpp;
-        uint8_t       *du = dy + (size_t)src_hs * src_vs * bpp;
-        for (int r = 0; r < copy_h / 2; r++)
-            memcpy(du + (size_t)r * src_hs * bpp,
-                   su + (size_t)r * src_hs * bpp,
-                   (size_t)src_hs * bpp);
+        /* Y plane */
+        memcpy(dst, src, (size_t)src_hs * src_vs * bpp);
+        /* UV plane (NV12): follows immediately after luma */
+        memcpy(dst + (size_t)dst_hs * dst_vs * bpp,
+               src + (size_t)src_hs * src_vs * bpp,
+               (size_t)src_hs * (src_vs / 2) * bpp);
         copied = 1;
     }
     mpp_frame_deinit(&frame);
